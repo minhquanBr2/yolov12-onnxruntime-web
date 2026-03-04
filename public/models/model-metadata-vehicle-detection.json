@@ -1,0 +1,32 @@
+{
+  "inputSize": [
+    640,
+    640
+  ],
+  "classes": [
+    "front",
+    "left",
+    "rear",
+    "right",
+    "front-left",
+    "front-right",
+    "rear-left",
+    "rear-right",
+    "taplo",
+    "lack-corner",
+    "left-headlight",
+    "right-headlight",
+    "windshield"
+  ],
+  "confidenceThreshold": 0.25,
+  "nmsThreshold": 0.4,
+  "modelName": "YOLOv8 Nano (Custom)",
+  "version": "8.0.0",
+  "description": "Custom YOLOv8 model optimized for mobile/edge devices.",
+  "author": "Ultralytics / Your Name",
+  "license": "AGPL-3.0",
+  "framework": "PyTorch",
+  "parameters": {
+    "numParameters (M)": 11.140631
+  }
+}

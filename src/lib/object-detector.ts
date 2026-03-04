@@ -2,12 +2,16 @@ import * as ort from 'onnxruntime-web/webgpu';
 import { Detection, ModelMetadata } from './types';
 
 /**
- * Object detection using YOLOv12 ONNX model via ONNX Runtime Web
+ * Object detection using YOLOv8 - vehicle detection ONNX model via ONNX Runtime Web
  */
 export class ObjectDetector {
   private session: ort.InferenceSession | null = null;
   private metadata: ModelMetadata | null = null;
   private isInitialized = false;
+  private preprocessCanvas: HTMLCanvasElement | null = null;
+  private preprocessCtx: CanvasRenderingContext2D | null = null;
+  private tempCanvas: HTMLCanvasElement | null = null;
+  private tempCtx: CanvasRenderingContext2D | null = null;
 
   /**
    * Initializes the ONNX model session and loads metadata
@@ -25,43 +29,48 @@ export class ObjectDetector {
       const basePath = import.meta.env.BASE_URL || '/';
       
       // Load model metadata
-      const metadataResponse = await fetch(`${basePath}models/model-metadata.json`);
+      const metadataResponse = await fetch(`${basePath}models/model-metadata-vehicle-detection.json`);
       this.metadata = await metadataResponse.json();
       
-      // Try different execution providers in order of preference
-      // WebGPU is preferred for better performance on supported browsers
+      // Try different execution providers in order of preference.
+      // On mobile browsers, prefer WASM for better stability.
+      // Thay đổi thứ tự ưu tiên: Ưu tiên GPU để giảm tải cho CPU
       const executionProviders = [
-        ['webgpu'],
-        // ['wasm'], // Fallback to WASM if WebGPU is not available
-        // ['cpu']   // Final fallback to CPU
+        { name: 'webgpu', priority: 1 },
+        { name: 'webgl', priority: 2 },
+        { name: 'wasm', priority: 3 }
       ];
 
       let lastError: Error | null = null;
       
-      for (const providers of executionProviders) {
+      for (const provider of executionProviders) {
         try {
-          console.log(`Trying execution providers: ${providers.join(', ')}`);
-          
-          this.session = await ort.InferenceSession.create(`${basePath}models/yolov12n.onnx`, {
-            executionProviders: providers,
+          // 1. Log chính xác tên provider đang thử (ví dụ: 'webgpu')
+          console.log(`Trying execution provider: ${provider.name}`);
+
+          // Thêm cấu hình giảm tải bộ nhớ trong InferenceSession.create
+          this.session = await ort.InferenceSession.create(`${basePath}models/yolo_vehicle_detection_model.onnx`, {
+            executionProviders: [provider.name],
             graphOptimizationLevel: 'all',
-            enableCpuMemArena: true,
-            enableMemPattern: true
+            enableCpuMemArena: false, // Tắt arena để tiết kiệm RAM trên mobile
+            enableMemPattern: false    // Tắt memory pattern nếu vẫn còn crash
           });
 
-          // Log model input/output names for debugging
           console.log('Model input names:', this.session.inputNames);
           console.log('Model output names:', this.session.outputNames);
           console.log('Model input metadata:', this.session.inputMetadata);
           console.log('Model output metadata:', this.session.outputMetadata);
 
+          // 2. Nếu thành công
           this.isInitialized = true;
-          console.log(`Object detector initialized successfully with providers: ${providers.join(', ')}`);
-          return;
+          console.log(`Object detector initialized successfully with provider: ${provider.name}`);
+          return; // Thoát hàm initialize
+
         } catch (error) {
-          console.warn(`Failed with providers ${providers.join(', ')}:`, error);
+          // 3. Fix log khi lỗi: dùng provider.name thay vì .join()
+          console.warn(`Failed with provider ${provider.name}:`, error);
           lastError = error as Error;
-          continue;
+          // Loop sẽ tự động 'continue' sang provider tiếp theo trong danh sách
         }
       }
 
@@ -84,33 +93,60 @@ export class ObjectDetector {
       throw new Error('Detector not initialized');
     }
 
+    if (!this.session || !this.isInitialized) return [];
+
+    let inputTensor: ort.Tensor | null = null;
+    let results: ort.InferenceSession.ReturnType | null = null;
+
     try {
-      // Preprocess image
-      const input = this.preprocessImage(imageData);
-      
-      console.log(input);
+      // 1. Tiền xử lý
+      inputTensor = this.preprocessImage(imageData);
 
-      // Run inference using actual model input/output names
+      // 2. Chạy Inference
       const inputName = this.session.inputNames[0];
-      const outputName = this.session.outputNames[0];
-      
-      console.log(`Using input name: ${inputName}, output name: ${outputName}`);
-      
-      const results = await this.session.run({ [inputName]: input });
-      const output = results[outputName] as ort.Tensor;
-      
-      console.log('Model output results:', results);
-      console.log('Output tensor:', output);
-      console.log('Tensor shape:', output.dims);
-      console.log('Tensor data type:', output.type);
+      results = await this.session.run({ [inputName]: inputTensor });
 
-      // Postprocess results
-      const detections = this.postprocessResults(output, imageData.width, imageData.height);
+      // 3. Lấy kết quả đầu ra
+      const outputName = this.session.outputNames[0];
+      const outputTensor = results[outputName];
+
+      // 4. Hậu xử lý (NMS, Scaling...)
+      console.log('Output tensor shape:', outputTensor.dims);
+      console.log('Output tensor', outputTensor);
+
+      const detections = this.postprocessResults(outputTensor, imageData.width, imageData.height);
+      console.log('Detected objects:', detections);
+      console.log(
+        `[Frame] Final detections (${detections.length}):`,
+        detections.map((detection, index) => ({
+          index,
+          class: detection.class,
+          confidence: Number(detection.confidence.toFixed(3)),
+          box: {
+            x: Math.round(detection.x),
+            y: Math.round(detection.y),
+            width: Math.round(detection.width),
+            height: Math.round(detection.height)
+          }
+        }))
+      );
       
       return detections;
+
     } catch (error) {
       console.error('Detection failed:', error);
       return [];
+    } finally {
+      // 5. GIẢI PHÓNG BỘ NHỚ - CỰC KỲ QUAN TRỌNG
+      if (inputTensor) {
+        inputTensor.dispose(); // Xóa tensor đầu vào
+      }
+      if (results) {
+        // Duyệt qua tất cả output tensors để giải phóng
+        for (const key in results) {
+          results[key].dispose();
+        }
+      }
     }
   }
 
@@ -119,12 +155,12 @@ export class ObjectDetector {
    */
   private preprocessImage(imageData: ImageData): ort.Tensor {
     const [inputWidth, inputHeight] = this.metadata!.inputSize;
-    
-    // Create canvas for padded image
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d')!;
-    canvas.width = inputWidth;
-    canvas.height = inputHeight;
+
+    this.ensurePreprocessCanvases(inputWidth, inputHeight, imageData.width, imageData.height);
+
+    const ctx = this.preprocessCtx!;
+    const tempCanvas = this.tempCanvas!;
+    const tempCtx = this.tempCtx!;
     
     // Fill canvas with black background (padding)
     ctx.fillStyle = '#000000';
@@ -150,12 +186,6 @@ export class ObjectDetector {
       offsetY = 0;
     }
     
-    // Create a temporary canvas to hold the original image data
-    const tempCanvas = document.createElement('canvas');
-    const tempCtx = tempCanvas.getContext('2d')!;
-    tempCanvas.width = imageData.width;
-    tempCanvas.height = imageData.height;
-    
     // Put the ImageData onto the temporary canvas
     tempCtx.putImageData(imageData, 0, 0);
     
@@ -177,125 +207,178 @@ export class ObjectDetector {
     return new ort.Tensor('float32', data, [1, 3, inputHeight, inputWidth]);
   }
 
+  private ensurePreprocessCanvases(
+    inputWidth: number,
+    inputHeight: number,
+    sourceWidth: number,
+    sourceHeight: number
+  ): void {
+    if (!this.preprocessCanvas || !this.preprocessCtx) {
+      this.preprocessCanvas = document.createElement('canvas');
+      this.preprocessCtx = this.preprocessCanvas.getContext('2d');
+    }
+
+    if (!this.tempCanvas || !this.tempCtx) {
+      this.tempCanvas = document.createElement('canvas');
+      this.tempCtx = this.tempCanvas.getContext('2d');
+    }
+
+    if (!this.preprocessCtx || !this.tempCtx) {
+      throw new Error('Canvas 2D context is not available');
+    }
+
+    if (this.preprocessCanvas!.width !== inputWidth || this.preprocessCanvas!.height !== inputHeight) {
+      this.preprocessCanvas!.width = inputWidth;
+      this.preprocessCanvas!.height = inputHeight;
+    }
+
+    if (this.tempCanvas!.width !== sourceWidth || this.tempCanvas!.height !== sourceHeight) {
+      this.tempCanvas!.width = sourceWidth;
+      this.tempCanvas!.height = sourceHeight;
+    }
+  }
+
   /**
    * Converts model output to Detection objects with transformed coordinates
    */
   private postprocessResults(output: ort.Tensor, originalWidth: number, originalHeight: number): Detection[] {
     const [inputWidth, inputHeight] = this.metadata!.inputSize;
-    
-    // Calculate padding offsets for coordinate transformation
-    const aspectRatio = originalWidth / originalHeight;
-    const targetAspectRatio = inputWidth / inputHeight;
-    
-    let paddingX, paddingY, scaleX, scaleY;
-    
-    if (aspectRatio > targetAspectRatio) {
-      // Image was fitted to width, padded top/bottom
-      scaleX = originalWidth / inputWidth;
-      scaleY = originalWidth / inputWidth; // Same scale for both dimensions
-      paddingX = 0;
-      paddingY = (inputHeight - (inputWidth / aspectRatio)) / 2;
-    } else {
-      // Image was fitted to height, padded left/right
-      scaleX = originalHeight / inputHeight;
-      scaleY = originalHeight / inputHeight; // Same scale for both dimensions
-      paddingX = (inputWidth - (inputHeight * aspectRatio)) / 2;
-      paddingY = 0;
-    }
-    
-    const detections: Detection[] = [];
     const outputData = output.data as Float32Array;
-    
-    // YOLO output format: [batch, num_detections, 6] where 6 = x1, y1, x2, y2, confidence, class_id
-    const numDetections = output.dims[1]; // 300
-    console.log(`Processing ${numDetections} detections from tensor shape:`, output.dims);
-    
-    for (let i = 0; i < numDetections; i++) {
-      const startIdx = i * 6; // Fixed 6 values per detection
-      
-      // Get bounding box coordinates (x1, y1, x2, y2)
-      const x1 = outputData[startIdx];
-      const y1 = outputData[startIdx + 1];
-      const x2 = outputData[startIdx + 2];
-      const y2 = outputData[startIdx + 3];
-      const confidence = outputData[startIdx + 4];
-      const classId = Math.round(outputData[startIdx + 5]); // Class ID as integer
-      
-      // Skip low confidence detections
-      if (confidence < this.metadata!.confidenceThreshold) continue;
-      
-      // Debug logging for first few detections
-      if (i < 5) {
-        console.log(`Detection ${i}:`, {
-          x1, y1, x2, y2, confidence, classId,
-          className: this.metadata!.classes[classId] || `class_${classId}`
-        });
-      }
-      
-      // Transform from padded coordinates to original image coordinates
-      const transformedX1 = (x1 - paddingX) * scaleX;
-      const transformedY1 = (y1 - paddingY) * scaleY;
-      const transformedX2 = (x2 - paddingX) * scaleX;
-      const transformedY2 = (y2 - paddingY) * scaleY;
-      
-      // Convert to Detection format (x, y, width, height)
-      const x = Math.max(0, transformedX1);
-      const y = Math.max(0, transformedY1);
-      const width = Math.max(0, transformedX2 - transformedX1);
-      const height = Math.max(0, transformedY2 - transformedY1);
-      
-      // Get class name from metadata
-      const className = this.metadata!.classes[classId] || `class_${classId}`;
-      
-      const detection: Detection = {
-        x: Math.max(0, x),
-        y: Math.max(0, y),
-        width: Math.min(width, originalWidth - x),
-        height: Math.min(height, originalHeight - y),
-        confidence: confidence,
-        class: className
+    const detections: Detection[] = [];
+
+    const dims = output.dims;
+    const classCount = this.metadata!.classes.length;
+    const expectedAttributes = 4 + classCount;
+
+    let numAttributes = 0;
+    let numAnchors = 0;
+    let getValue: (attributeIndex: number, anchorIndex: number) => number;
+
+    // Support both common YOLO output layouts:
+    // - [1, attributes, anchors]
+    // - [1, anchors, attributes]
+    if (dims.length === 3 && dims[1] === expectedAttributes) {
+      numAttributes = dims[1];
+      numAnchors = dims[2];
+      getValue = (attributeIndex: number, anchorIndex: number) => {
+        return outputData[attributeIndex * numAnchors + anchorIndex];
       };
-      
-      detections.push(detection);
+    } else if (dims.length === 3 && dims[2] === expectedAttributes) {
+      numAnchors = dims[1];
+      numAttributes = dims[2];
+      getValue = (attributeIndex: number, anchorIndex: number) => {
+        return outputData[anchorIndex * numAttributes + attributeIndex];
+      };
+    } else {
+      console.warn('Unexpected output tensor shape:', dims);
+      return [];
     }
-    
-    console.log(`Found ${detections.length} detections after filtering`);
-    
-    // Apply Non-Maximum Suppression
-    return this.applyNMS(detections);
-  }
+
+    // Tính toán tỷ lệ scale và padding (giống phần trước)
+    const scale = Math.min(inputWidth / originalWidth, inputHeight / originalHeight);
+    const offsetX = (inputWidth - originalWidth * scale) / 2;
+    const offsetY = (inputHeight - originalHeight * scale) / 2;
+
+    for (let i = 0; i < numAnchors; i++) {
+        // 1. Tìm Class có điểm cao nhất trong 13 classes (từ index 4 đến 16)
+        let maxScore = -Infinity;
+        let classId = -1;
+
+        for (let j = 4; j < numAttributes; j++) {
+            const score = getValue(j, i);
+            if (score > maxScore) {
+                maxScore = score;
+                classId = j - 4;
+            }
+        }
+
+        // 2. Lọc theo ngưỡng Confidence
+        if (maxScore < this.metadata!.confidenceThreshold) continue;
+
+        // 3. Giải mã tọa độ [cx, cy, w, h] từ dữ liệu Transposed
+        const cx = getValue(0, i);
+        const cy = getValue(1, i);
+        const w = getValue(2, i);
+        const h = getValue(3, i);
+        console.log(`Anchor ${i}: cx=${cx}, cy=${cy}, w=${w}, h=${h}`);
+
+        // Chuyển từ Center (cx, cy) sang Top-Left (x1, y1)
+        const x1 = cx - w / 2;
+        const y1 = cy - h / 2;
+
+        // 4. Map ngược về tọa độ ảnh gốc
+        const realX = (x1 - offsetX) / scale;
+        const realY = (y1 - offsetY) / scale;
+        const realW = w / scale;
+        const realH = h / scale;
+
+        const clampedX = Math.max(0, Math.min(realX, originalWidth));
+        const clampedY = Math.max(0, Math.min(realY, originalHeight));
+        const clampedMaxX = Math.max(0, Math.min(realX + realW, originalWidth));
+        const clampedMaxY = Math.max(0, Math.min(realY + realH, originalHeight));
+        const clampedWidth = clampedMaxX - clampedX;
+        const clampedHeight = clampedMaxY - clampedY;
+
+        if (clampedWidth <= 1 || clampedHeight <= 1) continue;
+
+        detections.push({
+          x: clampedX,
+          y: clampedY,
+          width: clampedWidth,
+          height: clampedHeight,
+          confidence: maxScore,
+          class: this.metadata!.classes[classId] || `class_${classId}`
+        });
+    }
+
+    // 5. NMS (Rất quan trọng vì 8400 anchors sẽ tạo ra rất nhiều box trùng nhau)
+    // Tuy nhiên trước khi NMS, cần lọc bớt các box có confidence thấp
+    const filtered_detections = detections.filter(d => d.confidence > this.metadata!.confidenceThreshold);
+    return this.applyNMS(filtered_detections);
+}
 
   /**
    * Applies Non-Maximum Suppression to remove overlapping detections
    */
   private applyNMS(detections: Detection[]): Detection[] {
-    // Sort by confidence
-    detections.sort((a, b) => b.confidence - a.confidence);
-    
+    const detectionsByClass = new Map<string, Detection[]>();
+    for (const detection of detections) {
+      const existing = detectionsByClass.get(detection.class);
+      if (existing) {
+        existing.push(detection);
+      } else {
+        detectionsByClass.set(detection.class, [detection]);
+      }
+    }
+
     const filtered: Detection[] = [];
-    const used = new Set<number>();
-    
-    for (let i = 0; i < detections.length; i++) {
-      if (used.has(i)) continue;
-      
-      const detection = detections[i];
-      filtered.push(detection);
-      used.add(i);
-      
-      // Remove overlapping detections
-      for (let j = i + 1; j < detections.length; j++) {
-        if (used.has(j)) continue;
-        
-        const other = detections[j];
-        const iou = this.calculateIoU(detection, other);
-        
-        if (iou > this.metadata!.nmsThreshold) {
-          used.add(j);
+
+    for (const classDetections of detectionsByClass.values()) {
+      classDetections.sort((a, b) => b.confidence - a.confidence);
+
+      const used = new Set<number>();
+
+      for (let i = 0; i < classDetections.length; i++) {
+        if (used.has(i)) continue;
+
+        const detection = classDetections[i];
+        filtered.push(detection);
+        used.add(i);
+
+        for (let j = i + 1; j < classDetections.length; j++) {
+          if (used.has(j)) continue;
+
+          const other = classDetections[j];
+          const iou = this.calculateIoU(detection, other);
+
+          if (iou > this.metadata!.nmsThreshold) {
+            used.add(j);
+          }
         }
       }
     }
-    
-    return filtered;
+
+    return filtered.sort((a, b) => b.confidence - a.confidence);
   }
 
   /**

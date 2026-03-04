@@ -13,6 +13,9 @@ import { checkBrowserCompatibility } from '@/lib/browser-checks';
 import { Play, Square, Info, Camera, CameraOff } from 'lucide-react';
 import './globals.css';
 
+const DETECTION_FPS = 5;
+const DETECTION_INTERVAL_MS = 1000 / DETECTION_FPS;
+
 function App() {
   // State management
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -284,6 +287,8 @@ function App() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+
+    setDetections([]);
   }, [isProcessing]);
 
   // Start/stop processing
@@ -292,6 +297,7 @@ function App() {
 
     try {
       setIsProcessing(true);
+      setDetections([]);
 
       const processor = new VideoProcessor(
         (newDetections) => {
@@ -302,20 +308,37 @@ function App() {
       );
 
       processor.setVideo(videoRef.current);
+      processor.setFrameRate(DETECTION_FPS);
       processor.startProcessing();
       processorRef.current = processor;
 
+      let lastDetectionTime = 0;
+      let isDetectionInFlight = false;
+
       // Start detection loop
-      const detectLoop = async () => {
+      const detectLoop = (timestamp: number) => {
         if (!detectorRef.current || !processorRef.current) return;
 
-        const frame = processorRef.current.getCurrentFrame();
-        if (frame) {
-          try {
-            const newDetections = await detectorRef.current.detectObjects(frame);
-            processorRef.current.updateDetections(newDetections);
-          } catch (err) {
-            console.error('Detection error:', err);
+        if (!isDetectionInFlight && timestamp - lastDetectionTime >= DETECTION_INTERVAL_MS) {
+          const frame = processorRef.current.getCurrentFrame();
+          if (frame) {
+            isDetectionInFlight = true;
+            lastDetectionTime = timestamp;
+
+            detectorRef.current.detectObjects(frame)
+              .then((newDetections) => {
+                if (processorRef.current) {
+                  processorRef.current.updateDetections(newDetections);
+                }
+              })
+              .catch((err) => {
+                console.error('Detection error:', err);
+              })
+              .finally(() => {
+                isDetectionInFlight = false;
+              });
+          } else {
+            setDetections([]);
           }
         }
 
@@ -325,7 +348,7 @@ function App() {
         }
       };
 
-      detectLoop();
+       requestAnimationFrame(detectLoop);
     } catch (err) {
       console.error('Failed to start processing:', err);
       setIsProcessing(false);
@@ -338,6 +361,8 @@ function App() {
     if (processorRef.current) {
       processorRef.current.stopProcessing();
     }
+
+    setDetections([]);
   }, []);
 
 
@@ -534,7 +559,8 @@ function App() {
                                 video: {
                                   width: { ideal: 1280 },
                                   height: { ideal: 720 },
-                                  frameRate: { ideal: 30 }
+                                  frameRate: { ideal: 30 },
+                                  facingMode: { ideal: 'environment' }
                                 },
                                 audio: false
                               });

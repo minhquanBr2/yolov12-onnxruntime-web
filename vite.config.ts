@@ -18,6 +18,9 @@ export default defineConfig({
     assetsDir: 'assets',
   },
   server: {
+    host: '0.0.0.0', // Exposes to local network
+    port: 20710,      // Your preferred port
+    allowedHosts: ['if-wan4.selab.edu.vn', 'yolo-detection.selab.edu.vn'], // Thêm dòng này
     headers: {
       'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cross-Origin-Opener-Policy': 'same-origin',
