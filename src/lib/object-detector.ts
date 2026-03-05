@@ -90,66 +90,71 @@ export class ObjectDetector {
    * @returns Array of detected objects with bounding boxes and confidence scores
    */
   async detectObjects(imageData: ImageData): Promise<Detection[]> {
-    if (!this.session || !this.metadata || !this.isInitialized) {
-      throw new Error('Detector not initialized');
+  if (!this.session || !this.isInitialized) return [];
+
+  let inputTensor: ort.Tensor | null = null;
+  let results: ort.InferenceSession.ReturnType | null = null;
+
+  try {
+    // --- BƯỚC 1: TIỀN XỬ LÝ ---
+    sendLog('worker', 'Worker: Detector is detecting objects');
+    inputTensor = this.preprocessImage(imageData);
+    sendLog('worker', 'Preprocessing image...');
+    
+    // Log kiểm tra input: Lấy 5 giá trị đầu để xem có phải toàn 0 không
+    const inputSample = (inputTensor.data as Float32Array).slice(0, 5);
+    sendLog('worker', `[Step 1] Preprocess OK. Shape: ${inputTensor.dims.join('x')}. Sample: [${inputSample.join(', ')}]`);
+
+    // --- BƯỚC 2: CHẠY INFERENCE ---
+    const inputName = this.session.inputNames[0];
+    const startTime = performance.now();
+    results = await this.session.run({ [inputName]: inputTensor });
+    const endTime = performance.now();
+
+    // --- BƯỚC 3: KIỂM TRA OUTPUT TENSOR ---
+    const outputName = this.session.outputNames[0];
+    const outputTensor = results[outputName];
+    const rawData = outputTensor.data as Float32Array;
+
+    // Tính toán nhanh min/max/mean để xem model có "sống" không
+    let min = Infinity, max = -Infinity, sum = 0;
+    for (let i = 0; i < Math.min(rawData.length, 1000); i++) {
+        if (rawData[i] < min) min = rawData[i];
+        if (rawData[i] > max) max = rawData[i];
+        sum += rawData[i];
     }
 
-    if (!this.session || !this.isInitialized) return [];
+    sendLog('worker', `[Step 2] Inference Time: ${(endTime - startTime).toFixed(2)}ms`);
+    sendLog('worker', `[Step 3] Output Dims: ${outputTensor.dims.join('x')}. Data Stats (first 1000): min=${min.toFixed(4)}, max=${max.toFixed(4)}, avg=${(sum/1000).toFixed(4)}`);
 
-    let inputTensor: ort.Tensor | null = null;
-    let results: ort.InferenceSession.ReturnType | null = null;
+    // --- BƯỚC 4: HẬU XỬ LÝ ---
+    // Nếu max score quá thấp (ví dụ < 0.1), chắc chắn là model ko nhận diện được gì
+    if (max < (this.metadata?.confidenceThreshold || 0.3)) {
+        sendLog('warn', `[Step 4] Warning: Max raw score (${max.toFixed(4)}) is below threshold. Probably no objects found.`);
+    }
 
-    try {
-      // 1. Tiền xử lý
-      inputTensor = this.preprocessImage(imageData);
+    const detections = this.postprocessResults(outputTensor, imageData.width, imageData.height);
+    
+    // Log kết quả cuối cùng
+    if (detections.length === 0) {
+        sendLog('warn', `[Final] 0 objects detected. Check if logic matches Transposed format [1, 17, 8400]`);
+    } else {
+        sendLog('info', `[Final] Success! Found ${detections.length} objects.`);
+    }
+    
+    return detections;
 
-      // 2. Chạy Inference
-      const inputName = this.session.inputNames[0];
-      results = await this.session.run({ [inputName]: inputTensor });
-
-      // 3. Lấy kết quả đầu ra
-      const outputName = this.session.outputNames[0];
-      const outputTensor = results[outputName];
-
-      // 4. Hậu xử lý (NMS, Scaling...)
-      sendLog('worker', `Output tensor shape: ${outputTensor.dims.join('x')}`);
-      sendLog('worker', `Output tensor: ${JSON.stringify(outputTensor)}`);
-
-      const detections = this.postprocessResults(outputTensor, imageData.width, imageData.height);
-      sendLog('worker', `Detected objects: ${JSON.stringify(detections)}`);
-      sendLog('worker',
-        `[Frame] Final detections (${detections.length}): ` + 
-        detections.map((detection, index) => ({
-          index,
-          class: detection.class,
-          confidence: Number(detection.confidence.toFixed(3)),
-          box: {
-            x: Math.round(detection.x),
-            y: Math.round(detection.y),
-            width: Math.round(detection.width),
-            height: Math.round(detection.height)
-          }
-        }))
-      );
-      
-      return detections;
-
-    } catch (error) {
-      console.error('Detection failed:', error);
-      return [];
-    } finally {
-      // 5. GIẢI PHÓNG BỘ NHỚ - CỰC KỲ QUAN TRỌNG
-      if (inputTensor) {
-        inputTensor.dispose(); // Xóa tensor đầu vào
-      }
-      if (results) {
-        // Duyệt qua tất cả output tensors để giải phóng
-        for (const key in results) {
-          results[key].dispose();
-        }
-      }
+  } catch (error: any) {
+    sendLog('error', `DETECTION CRITICAL ERROR: ${error.message}`);
+    return [];
+  } finally {
+    // GIẢI PHÓNG BỘ NHỚ
+    if (inputTensor) inputTensor.dispose();
+    if (results) {
+      for (const key in results) results[key].dispose();
     }
   }
+}
 
   /**
    * Preprocesses image for model input: resizes, pads, and normalizes to [0,1]
@@ -209,34 +214,48 @@ export class ObjectDetector {
   }
 
   private ensurePreprocessCanvases(
-    inputWidth: number,
-    inputHeight: number,
-    sourceWidth: number,
-    sourceHeight: number
-  ): void {
-    if (!this.preprocessCanvas || !this.preprocessCtx) {
-      this.preprocessCanvas = document.createElement('canvas');
-      this.preprocessCtx = this.preprocessCanvas.getContext('2d');
-    }
+      inputWidth: number,
+      inputHeight: number,
+      sourceWidth: number,
+      sourceHeight: number
+    ): void {
+      // Kiểm tra xem có đang ở trong Worker hay không
+      const isWorker = typeof window === 'undefined';
 
-    if (!this.tempCanvas || !this.tempCtx) {
-      this.tempCanvas = document.createElement('canvas');
-      this.tempCtx = this.tempCanvas.getContext('2d');
-    }
+      if (!this.preprocessCanvas || !this.preprocessCtx) {
+        if (isWorker) {
+          // TRONG WORKER: Dùng OffscreenCanvas
+          this.preprocessCanvas = new OffscreenCanvas(inputWidth, inputHeight) as any;
+        } else {
+          // TRONG MAIN THREAD: Dùng document (nếu vẫn muốn dùng ở Main)
+          this.preprocessCanvas = document.createElement('canvas');
+        }
+        this.preprocessCtx = this.preprocessCanvas!.getContext('2d') as any;
+      }
 
-    if (!this.preprocessCtx || !this.tempCtx) {
-      throw new Error('Canvas 2D context is not available');
-    }
+      if (!this.tempCanvas || !this.tempCtx) {
+        if (isWorker) {
+          this.tempCanvas = new OffscreenCanvas(sourceWidth, sourceHeight) as any;
+        } else {
+          this.tempCanvas = document.createElement('canvas');
+        }
+        this.tempCtx = this.tempCanvas!.getContext('2d') as any;
+      }
 
-    if (this.preprocessCanvas!.width !== inputWidth || this.preprocessCanvas!.height !== inputHeight) {
-      this.preprocessCanvas!.width = inputWidth;
-      this.preprocessCanvas!.height = inputHeight;
-    }
+      if (!this.preprocessCtx || !this.tempCtx) {
+        throw new Error('Canvas 2D context is not available');
+      }
 
-    if (this.tempCanvas!.width !== sourceWidth || this.tempCanvas!.height !== sourceHeight) {
-      this.tempCanvas!.width = sourceWidth;
-      this.tempCanvas!.height = sourceHeight;
-    }
+      // Cập nhật kích thước nếu cần
+      if (this.preprocessCanvas!.width !== inputWidth || this.preprocessCanvas!.height !== inputHeight) {
+        this.preprocessCanvas!.width = inputWidth;
+        this.preprocessCanvas!.height = inputHeight;
+      }
+
+      if (this.tempCanvas!.width !== sourceWidth || this.tempCanvas!.height !== sourceHeight) {
+        this.tempCanvas!.width = sourceWidth;
+        this.tempCanvas!.height = sourceHeight;
+      }
   }
 
   /**

@@ -11,13 +11,13 @@ import { Detection } from '@/lib/types';
 import { checkBrowserCompatibility } from '@/lib/browser-checks';
 import { Play, Square, Info, Camera, CameraOff } from 'lucide-react';
 import './globals.css';
-import { sendLog } from './lib/utils'
+import { sendLog } from './lib/utils';
 
 const DETECTION_FPS = 5;
 const DETECTION_INTERVAL_MS = 1000 / DETECTION_FPS;
 
 function App() {
-  // State management
+  // --- States ---
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedImage, setSelectedImage] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -32,433 +32,194 @@ function App() {
   const [isInfoDialogOpen, setIsInfoDialogOpen] = useState(false);
   const [inputType, setInputType] = useState<'upload' | 'camera'>('upload');
 
-  // Refs
+  // --- Refs (Điều khiển logic ngầm) ---
   const videoRef = useRef<HTMLVideoElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const processorRef = useRef<VideoProcessor | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workerRef = useRef<Worker | null>(null);
+  
+  const isProcessingRef = useRef(false);
+  const isDetectionInFlightRef = useRef(false);
+  const lastDetectionTimeRef = useRef(0);
+
+  // --- Helpers ---
   const shouldRotateCameraToLandscape = isCameraActive && isDeviceLandscape && isCameraSourcePortrait;
   const cameraPreviewTransform = shouldRotateCameraToLandscape
     ? `rotate(90deg) scale(${cameraSourceAspectRatio})`
     : 'none';
 
+  const stopProcessing = useCallback(() => {
+    setIsProcessing(false);
+    isProcessingRef.current = false;
+    isDetectionInFlightRef.current = false;
+    if (processorRef.current) processorRef.current.reset();
+    setDetections([]);
+    sendLog('info', 'Detection system stopped and reset');
+  }, []);
+
   const updateCameraDisplayDimensions = useCallback((sourceWidth: number, sourceHeight: number) => {
     const shouldRotate = isDeviceLandscape && sourceHeight > sourceWidth;
-
     if (shouldRotate) {
       setVideoDimensions({ width: sourceHeight, height: sourceWidth });
       return;
     }
-
     setVideoDimensions({ width: sourceWidth, height: sourceHeight });
   }, [isDeviceLandscape]);
 
-  // Check browser compatibility on mount
-  useEffect(() => {
-    const compatibility = checkBrowserCompatibility();
-    if (!compatibility.allPassed) {
-      console.error('Browser compatibility issues:', compatibility.errors.join(' '));
-    }
-  }, []);
-
-  useEffect(() => {
-    const mediaQuery = window.matchMedia('(orientation: landscape)');
-
-    const handleOrientationChange = (event: MediaQueryListEvent) => {
-      setIsDeviceLandscape(event.matches);
-    };
-
-    setIsDeviceLandscape(mediaQuery.matches);
-
-    if (typeof mediaQuery.addEventListener === 'function') {
-      mediaQuery.addEventListener('change', handleOrientationChange);
-      return () => {
-        mediaQuery.removeEventListener('change', handleOrientationChange);
-      };
-    }
-
-    mediaQuery.addListener(handleOrientationChange);
-    return () => {
-      mediaQuery.removeListener(handleOrientationChange);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isCameraActive || !videoRef.current) {
-      return;
-    }
-
-    const { videoWidth, videoHeight } = videoRef.current;
-    if (!videoWidth || !videoHeight) {
-      return;
-    }
-
-    updateCameraDisplayDimensions(videoWidth, videoHeight);
-  }, [isCameraActive, isDeviceLandscape, updateCameraDisplayDimensions]);
-
-  // Clear detections and file selections when changing tabs
-  useEffect(() => {
-    setDetections([]);
-    
-    // Clear video file selection
-    if (selectedFile) {
-      // Clean up object URL if it exists
-      if (videoRef.current && videoRef.current.src && videoRef.current.src.startsWith('blob:')) {
-        URL.revokeObjectURL(videoRef.current.src);
-      }
-      setSelectedFile(null);
-      if (videoRef.current) {
-        videoRef.current.src = '';
-        videoRef.current.srcObject = null;
-      }
-      if (processorRef.current) {
-        processorRef.current.reset();
-      }
-    }
-    
-    // Clear image file selection
-    if (selectedImage) {
-      if (imageRef.current && imageRef.current.src && imageRef.current.src.startsWith('blob:')) {
-        URL.revokeObjectURL(imageRef.current.src);
-      }
-      setSelectedImage(null);
-      if (imageRef.current) {
-        imageRef.current.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'; // 1x1 transparent pixel
-      }
-    }
-    
-    // Also stop processing if it's running
-    if (isProcessing) {
-      setIsProcessing(false);
-      if (processorRef.current) {
-        processorRef.current.stopProcessing();
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inputType]);
-
-  // Initialize detector
+  // --- 1. Khởi tạo Worker ---
   useEffect(() => {
     sendLog('info', 'Spawning AI Worker...');
-    // Khởi tạo worker
-    const worker = new Worker(new URL('./lib/detector.worker.ts', import.meta.url), {
-      type: 'module'
-    });
+    const worker = new Worker(new URL('./lib/detector.worker.ts', import.meta.url), { type: 'module' });
 
     worker.onmessage = (e) => {
-      const { type, detections, error } = e.data;
-      if (type === 'ready') {
-        setIsDetectorReady(true);
-        sendLog('info', 'Worker is ready');
+      const { type, detections: results, error } = e.data;
+      if (type === 'ready') { setIsDetectorReady(true); sendLog('info', 'Worker is ready'); }
+      if (type === 'results') {
+        setDetections(results);
+        if (processorRef.current) processorRef.current.updateDetections(results);
+        isDetectionInFlightRef.current = false; // Mở khóa cho frame tiếp theo
+        if (inputType === 'upload' && selectedImage) setIsProcessing(false);
       }
-      if (type === 'results') {        
-        setDetections(detections);      // Cập nhật detections lên UI
-        setIsProcessing(false);         // Tắt loading khi có kết quả
-        if (processorRef.current) {
-          processorRef.current.updateDetections(detections);
-        }
-      }
-      if (type === 'error') {
-        sendLog('info', `Worker error: ${error}`);
-        setIsProcessing(false);
-      }
+      if (type === 'error') { sendLog('error', `Worker error: ${error}`); stopProcessing(); }
     };
 
     worker.postMessage({ type: 'init' });
     workerRef.current = worker;
+    return () => worker.terminate();
+  }, [inputType, selectedImage, stopProcessing]);
 
-    return () => {
-      worker.terminate();
-    };
+  // --- 2. Xử lý Camera Stream ---
+  const handleCameraStart = useCallback((stream: MediaStream) => {
+    sendLog('info', 'Camera stream connected');
+    streamRef.current = stream;
+    setIsCameraActive(true);
+    
+    setTimeout(() => {
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(e => sendLog('error', `Play error: ${e.message}`));
+      }
+    }, 150);
   }, []);
 
-  // Handle video element becoming available when camera is active
-  useEffect(() => {
-    if (isCameraActive && streamRef.current && videoRef.current) {
-      sendLog('info', 'Video element became available, setting stream');
-      videoRef.current.srcObject = streamRef.current;
-      videoRef.current.play().catch((err) => {
-        sendLog('error', `Failed to start camera preview: ${err.message}`);
-      });
+  const handleCameraStop = useCallback(() => {
+    stopProcessing();
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     }
-  }, [isCameraActive]);
+    setIsCameraActive(false);
+    if (videoRef.current) videoRef.current.srcObject = null;
+  }, [stopProcessing]);
 
-  // Handle video file selection - set video src when selectedFile changes
-  useEffect(() => {
-    if (selectedFile && videoRef.current && !isCameraActive) {
-      // Clear any existing stream
-      videoRef.current.srcObject = null;
-      
-      // Create object URL and set as source
-      const url = URL.createObjectURL(selectedFile);
-      videoRef.current.src = url;
-      
-      // Load the video
-      videoRef.current.load();
-      
-      // Cleanup function to revoke object URL when component unmounts or file changes
-      return () => {
-        URL.revokeObjectURL(url);
-      };
-    }
-  }, [selectedFile, isCameraActive]);
-
-  // Handle image file selection - set image src when selectedImage changes
-  useEffect(() => {
-    if (selectedImage && imageRef.current) {
-      // Create object URL and set as source
-      const url = URL.createObjectURL(selectedImage);
-      imageRef.current.src = url;
-      
-      // Set dimensions when image loads and automatically trigger detection
-      const handleImageLoad = async () => {
-        if (imageRef.current) {
-          if (!workerRef.current || !isDetectorReady) {
-            sendLog('warn', 'Detector worker is not ready for image detection');
-            setIsProcessing(false);
-            return;
-          }
-
-          const { naturalWidth, naturalHeight } = imageRef.current;
-          setImageDimensions({ width: naturalWidth, height: naturalHeight });
-          
-          // Automatically run detection when image loads
-          try {
-            setIsProcessing(true);
-
-            // Create canvas to get image data
-            const canvas = document.createElement('canvas');
-            const ctx = canvas.getContext('2d');
-            if (!ctx) {
-              setIsProcessing(false);
-              return;
-            }
-
-            canvas.width = naturalWidth;
-            canvas.height = naturalHeight;
-            ctx.drawImage(imageRef.current, 0, 0);
-
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-            // SỬA TẠI ĐÂY: Dùng optional chaining hoặc kiểm tra null
-            workerRef.current?.postMessage(
-              { type: 'detect', payload: { imageData } },
-              [imageData.data.buffer] 
-            );
-          } catch (err) {
-            sendLog('error', `Failed to detect objects in image: ${err instanceof Error ? err.message : String(err)}`);
-            setIsProcessing(false);
-          }
-        }
-      };
-      
-      imageRef.current.onload = handleImageLoad;
-      
-      // Cleanup function to revoke object URL when component unmounts or file changes
-      return () => {
-        URL.revokeObjectURL(url);
-      };
-    }
-  }, [selectedImage]);
-
-  // Handle video file selection
+  // --- 3. Xử lý File Upload (Video/Image) ---
   const handleVideoSelect = useCallback((file: File) => {
+    stopProcessing();
     setSelectedFile(file);
     setSelectedImage(null);
     setIsCameraActive(false);
-  }, []);
+  }, [stopProcessing]);
 
-  // Handle image file selection
   const handleImageSelect = useCallback((file: File) => {
+    stopProcessing();
     setSelectedImage(file);
     setSelectedFile(null);
     setIsCameraActive(false);
-  }, []);
+  }, [stopProcessing]);
 
-  // Handle image clear
-  const handleClearImage = useCallback(() => {
-    if (imageRef.current && imageRef.current.src && imageRef.current.src.startsWith('blob:')) {
-      URL.revokeObjectURL(imageRef.current.src);
-    }
-    setSelectedImage(null);
-    setDetections([]);
-    if (imageRef.current) {
-      imageRef.current.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'; // 1x1 transparent pixel
-    }
-  }, []);
-
+  // --- DỌN DẸP VIDEO ---
   const handleClearVideo = useCallback(() => {
-    // Clean up object URL if it exists
-    if (videoRef.current && videoRef.current.src && videoRef.current.src.startsWith('blob:')) {
+    // 1. Dừng AI ngay lập tức
+    stopProcessing();
+
+    // 2. Thu hồi bộ nhớ Object URL (Quan trọng để tránh leak RAM)
+    if (videoRef.current && videoRef.current.src.startsWith('blob:')) {
       URL.revokeObjectURL(videoRef.current.src);
     }
     
+    // 3. Reset States & Refs
     setSelectedFile(null);
     setDetections([]);
     
     if (videoRef.current) {
       videoRef.current.src = '';
       videoRef.current.srcObject = null;
+      videoRef.current.load(); // Buộc video reset trạng thái buffer
     }
     
-    if (processorRef.current) {
-      processorRef.current.reset();
-    }
-  }, []);
+    sendLog('info', 'Video cleared and memory released');
+  }, [stopProcessing]);
 
-  // Handle camera stream
-  const handleCameraStart = useCallback((stream: MediaStream) => {
-    sendLog('info', `handleCameraStart called with stream: ${stream}`);
-    streamRef.current = stream;
-    setIsCameraActive(true);
-    
-    // Wait for the video element to be rendered after isCameraActive becomes true
-    const setStreamToVideo = () => {
-      if (videoRef.current) {
-        sendLog('info', 'Setting stream to video element');
-        
-        // Clear any existing source first
-        videoRef.current.srcObject = null;
-        
-        // Set the new stream
-        videoRef.current.srcObject = stream;
-        
-        // Wait a bit for the stream to be ready, then play
-        setTimeout(() => {
-          if (videoRef.current && videoRef.current.srcObject) {
-            sendLog('info', 'Attempting to play video');
-            videoRef.current.play().catch((err) => {
-              console.error('Failed to start camera preview:', err);
-              sendLog('error', 'Failed to start camera preview');
-            });
-          }
-        }, 100);
-      } else {
-        sendLog('info', 'Video element not ready yet, retrying...');
-        setTimeout(setStreamToVideo, 50);
-      }
-    };
-    
-    // Start trying to set the stream after a short delay
-    setTimeout(setStreamToVideo, 100);
-  }, []);
+  // --- DỌN DẸP IMAGE ---
+  const handleClearImage = useCallback(() => {
+    // 1. Dừng AI
+    stopProcessing();
 
-  const handleCameraStop = useCallback(() => {
-    // Stop detection if it's running
-    if (isProcessing) {
-      setIsProcessing(false);
-      if (processorRef.current) {
-        processorRef.current.stopProcessing();
-      }
+    // 2. Thu hồi bộ nhớ
+    if (imageRef.current && imageRef.current.src.startsWith('blob:')) {
+      URL.revokeObjectURL(imageRef.current.src);
     }
     
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    
-    setIsCameraActive(false);
-    setIsCameraSourcePortrait(false);
-    setCameraSourceAspectRatio(16 / 9);
-    
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-
+    // 3. Reset States
+    setSelectedImage(null);
     setDetections([]);
-  }, [isProcessing]);
+    setImageDimensions({ width: 0, height: 0 });
 
-  // Start/stop processing
-  const startProcessing = useCallback(async () => {
-    if (videoRef.current) {
-      sendLog('info', 'Video element is available');
-    } else {
-      sendLog('warn', 'Video element is not available');
+    // 4. Reset Image Element về ảnh trống (1x1 pixel) để tránh hiện icon "ảnh lỗi"
+    if (imageRef.current) {
+      imageRef.current.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
     }
-
-    if (!workerRef.current || !isDetectorReady) {
-      sendLog('warn', 'Detector worker is not ready');
-      return;
-    }
-
-    if (!videoRef.current) return;
-    sendLog('info', `Starting processing`);
-
-    try {
-      setIsProcessing(true);
-      setDetections([]);
-
-      const processor = new VideoProcessor(
-        (newDetections) => {
-          sendLog('info', `Displaying ${newDetections.length} detections for current frame`);
-          setDetections(newDetections);
-        },
-        () => {} // Stats callback not needed anymore
-      );
-
-      processor.setVideo(videoRef.current);
-      processor.setRotateClockwise90(shouldRotateCameraToLandscape);
-      processor.setFrameRate(DETECTION_FPS);
-      processor.startProcessing();
-      processorRef.current = processor;
-
-      let lastDetectionTime = 0;
-      let isDetectionInFlight = false;
-
-      // Start detection loop
-      const detectLoop = (timestamp: number) => {
-        if (!workerRef.current || !processorRef.current || !isDetectorReady) return;
-
-        if (!isDetectionInFlight && timestamp - lastDetectionTime >= DETECTION_INTERVAL_MS) {
-          const frame = processorRef.current.getCurrentFrame();
-          if (frame) {
-            isDetectionInFlight = true; // Flag này vẫn dùng để tránh spam worker
-            lastDetectionTime = timestamp;
-
-            // Gửi frame sang worker. 
-            // Dùng Transferable Objects để ko copy dữ liệu (giảm RAM)
-            workerRef.current?.postMessage(
-              { type: 'detect', payload: { imageData: frame } },
-              [frame.data.buffer]
-            );
-
-            // Reset flag sau một khoảng thời gian hoặc dựa trên message 'results'
-            // Để đơn giản, ta reset sau khi worker gửi kết quả về (đã sửa ở useEffect trên)
-            isDetectionInFlight = false; 
-          }
-        }
-
-        if (processorRef.current && !processorRef.current.isProcessingStopped()) {
-          requestAnimationFrame(detectLoop);
-        }
-      };
-
-       requestAnimationFrame(detectLoop);
-    } catch (err) {
-      console.error('Failed to start processing:', err);
-      setIsProcessing(false);
-    }
-  }, [shouldRotateCameraToLandscape]);
-
-  const stopProcessing = useCallback(() => {
-    setIsProcessing(false);
     
-    if (processorRef.current) {
-      processorRef.current.stopProcessing();
-    }
+    sendLog('info', 'Image cleared and memory released');
+  }, [stopProcessing]);
 
-    setDetections([]);
-  }, []);
+  // --- 4. Logic Detection Loop ---
+  const startProcessing = useCallback(() => {
+    if (!videoRef.current || !isDetectorReady || !workerRef.current) return;
 
-  useEffect(() => {
-    if (!isProcessing || !processorRef.current) {
-      return;
-    }
-
+    setIsProcessing(true);
+    isProcessingRef.current = true;
+    
+    processorRef.current = new VideoProcessor((res) => setDetections(res), () => {});
+    processorRef.current.setVideo(videoRef.current);
     processorRef.current.setRotateClockwise90(shouldRotateCameraToLandscape);
-  }, [isProcessing, shouldRotateCameraToLandscape]);
 
+    const detectLoop = (timestamp: number) => {
+      if (!isProcessingRef.current || !workerRef.current || !processorRef.current) return;
+
+      const elapsed = timestamp - lastDetectionTimeRef.current;
+      if (!isDetectionInFlightRef.current && elapsed >= DETECTION_INTERVAL_MS) {
+        const frame = processorRef.current.getCurrentFrame();
+        if (frame) {
+          isDetectionInFlightRef.current = true;
+          lastDetectionTimeRef.current = timestamp;
+          workerRef.current.postMessage({ type: 'detect', payload: { imageData: frame } }, [frame.data.buffer]);
+        }
+      }
+      requestAnimationFrame(detectLoop);
+    };
+    requestAnimationFrame(detectLoop);
+  }, [isDetectorReady, shouldRotateCameraToLandscape]);
+
+  // --- 5. Effect xử lý Image Detection tự động ---
+  useEffect(() => {
+    if (selectedImage && imageRef.current && isDetectorReady) {
+      const url = URL.createObjectURL(selectedImage);
+      imageRef.current.src = url;
+      imageRef.current.onload = () => {
+        const { naturalWidth, naturalHeight } = imageRef.current!;
+        setImageDimensions({ width: naturalWidth, height: naturalHeight });
+        setIsProcessing(true);
+        const canvas = new OffscreenCanvas(naturalWidth, naturalHeight);
+        const ctx = canvas.getContext('2d')!;
+        ctx.drawImage(imageRef.current!, 0, 0);
+        const imageData = ctx.getImageData(0, 0, naturalWidth, naturalHeight);
+        workerRef.current?.postMessage({ type: 'detect', payload: { imageData } }, [imageData.data.buffer]);
+      };
+      return () => URL.revokeObjectURL(url);
+    }
+  }, [selectedImage, isDetectorReady]);
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">

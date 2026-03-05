@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
+import fs from 'fs'; // Import the file system module
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -16,15 +17,30 @@ export default defineConfig({
             req.on('end', () => {
               try {
                 const { type, message, time } = JSON.parse(body);
-                const timestamp = new Date(time).toLocaleTimeString();
+                const date = new Date(time);
+                const timestamp = date.toLocaleTimeString();
+                const logDate = date.toISOString().split('T')[0]; // YYYY-MM-DD
                 
-                // ANSI Colors for terminal output
+                // 1. Prepare the log entry (text only, no ANSI colors for files)
+                const formattedMessage = typeof message === 'object' 
+                  ? JSON.stringify(message, null, 2) 
+                  : message;
+                const logEntry = `[${logDate} ${timestamp}] [${type.toUpperCase()}]: ${formattedMessage}\n`;
+
+                // 2. Write to file (appends to the end)
+                // The file will be created in your project root
+                fs.appendFile(
+                  path.resolve(__dirname, 'mobile-debug.log'), 
+                  logEntry, 
+                  (err) => {
+                    if (err) console.error('Failed to write to log file:', err);
+                  }
+                );
+
+                // 3. Optional: Keep printing to terminal so you see it live
                 const colors = { info: '\x1b[32m', warn: '\x1b[33m', error: '\x1b[31m', worker: '\x1b[36m', reset: '\x1b[0m' };
                 const color = colors[type as keyof typeof colors] || colors.info;
-
-                console.log(`${timestamp} [${color}${type.toUpperCase()}${colors.reset}]:`, 
-                  typeof message === 'object' ? JSON.stringify(message, null, 2) : message
-                );
+                console.log(`${timestamp} [${color}${type.toUpperCase()}${colors.reset}]:`, formattedMessage);
 
                 res.statusCode = 200;
                 res.end('OK');

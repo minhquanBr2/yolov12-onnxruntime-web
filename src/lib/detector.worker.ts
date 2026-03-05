@@ -24,6 +24,7 @@ self.onmessage = async (e) => {
     try {
       // Nhận ImageData và xử lý
       const detections = await detector.detectObjects(payload.imageData);
+      sendLog('worker', `Worker: Detection completed with number of objects: ${detections.length}`);
       // Gửi kết quả về Main Thread
       self.postMessage({ type: 'results', detections });
     } catch (err: any) {

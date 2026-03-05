@@ -1,19 +1,14 @@
 import { Detection, DetectionStats } from './types';
 
-/**
- * Processes video frames for object detection
- */
 export class VideoProcessor {
   private video: HTMLVideoElement | null = null;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private rotateClockwise90 = false;
-  private isProcessing = false;
-  private frameRate = 10; // Process 10 frames per second
-  private lastFrameTime = 0;
-  private detectionCallback: (detections: Detection[]) => void;
-  private statsCallback: (stats: DetectionStats) => void;
-  private allDetections: Detection[] = [];
+  
+  // Stats - Chuyển sang lưu trữ giá trị gộp thay vì mảng khổng lồ
+  private totalCount = 0;
+  private confidenceSum = 0;
   private stats: DetectionStats = {
     totalDetections: 0,
     averageConfidence: 0,
@@ -22,146 +17,69 @@ export class VideoProcessor {
   };
 
   constructor(
-    detectionCallback: (detections: Detection[]) => void,
-    statsCallback: (stats: DetectionStats) => void
+    private detectionCallback: (detections: Detection[]) => void,
+    private statsCallback: (stats: DetectionStats) => void
   ) {
-    this.detectionCallback = detectionCallback;
-    this.statsCallback = statsCallback;
-    
-    // Create hidden canvas for frame extraction
     this.canvas = document.createElement('canvas');
-    this.ctx = this.canvas.getContext('2d')!;
+    this.ctx = this.canvas.getContext('2d', { alpha: false })!; // Tắt alpha để render nhanh hơn
   }
 
-  /**
-   * Sets the video element to process
-   */
   setVideo(video: HTMLVideoElement): void {
     this.video = video;
-    this.updateCanvasSize();
   }
 
   setRotateClockwise90(rotate: boolean): void {
     this.rotateClockwise90 = rotate;
-    this.updateCanvasSize();
-  }
-
-  setFrameRate(fps: number): void {
-    this.frameRate = fps;
   }
 
   /**
-   * Starts frame extraction loop at configured frame rate
+   * Lấy frame hiện tại - Tối ưu hóa để App.tsx gọi trực tiếp
    */
-  startProcessing(): void {
-    if (!this.video) {
-      throw new Error('No video element set');
-    }
-    
-    this.isProcessing = true;
-    this.processFrame();
-  }
-
-  stopProcessing(): void {
-    this.isProcessing = false;
-  }
-
-  isProcessingStopped(): boolean {
-    return !this.isProcessing;
-  }
-
-  private processFrame(): void {
-    if (!this.isProcessing || !this.video) return;
-
-    const now = performance.now();
-    const timeSinceLastFrame = now - this.lastFrameTime;
-    const targetFrameTime = 1000 / this.frameRate;
-
-    if (timeSinceLastFrame >= targetFrameTime) {
-      this.extractFrame();
-      this.lastFrameTime = now;
-    }
-
-    requestAnimationFrame(() => this.processFrame());
-  }
-
-  private extractFrame(): void {
-    if (!this.video || this.video.videoWidth === 0 || this.video.videoHeight === 0) {
-      return;
-    }
+  getCurrentFrame(): ImageData | null {
+    if (!this.video || this.video.videoWidth === 0 || this.video.videoHeight === 0) return null;
 
     this.updateCanvasSize();
     this.drawCurrentFrame();
     
-    // Get image data for processing
-    const imageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
-    
-    // Emit frame for detection (this will be handled by the detector)
-    this.emitFrame(imageData);
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  private emitFrame(_: ImageData): void {
-    // This method will be called by the detector when it's ready to process
-    // The actual detection logic is in the PotholeDetector class
+    // ImageData này sẽ được "Transfer" sang Worker, nên ko lo leak RAM ở đây
+    return this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
   }
 
   /**
-   * Updates detection results and statistics
+   * Cập nhật kết quả mà không gây tràn RAM
    */
-  updateDetections(detections: Detection[]): void {
-    // Accumulate for statistics (total counts across all frames)
-    this.allDetections = [...this.allDetections, ...detections];
-    this.updateStats(detections);
+  updateDetections(newDetections: Detection[]): void {
+    if (newDetections.length > 0) {
+      this.updateStats(newDetections);
+    }
     
-    console.log(`Frame detections: ${detections.length}, Total accumulated: ${this.allDetections.length}`);
-    
-    // Send current frame detections for display (replaces previous frame's detections)
-    this.detectionCallback(detections);
+    // Chỉ gửi kết quả frame hiện tại về UI
+    this.detectionCallback(newDetections);
     this.statsCallback(this.stats);
   }
 
   private updateStats(newDetections: Detection[]): void {
-    if (newDetections.length === 0) return;
-
-    // Update counts
     this.stats.totalDetections += newDetections.length;
-    
-    newDetections.forEach(detection => {
-      // Count by class
-      if (this.stats.classCounts[detection.class]) {
-        this.stats.classCounts[detection.class]++;
-      } else {
-        this.stats.classCounts[detection.class] = 1;
+    this.stats.lastDetectionTime = Date.now();
+
+    newDetections.forEach(d => {
+      // 1. Cập nhật tổng confidence để tính trung bình
+      this.totalCount++;
+      this.confidenceSum += d.confidence;
+
+      // 2. Cập nhật đếm theo Class
+      if (!this.stats.classCounts[d.class]) {
+        this.stats.classCounts[d.class] = 0;
       }
+      this.stats.classCounts[d.class]++;
     });
 
-    // Update average confidence
-    const totalConfidence = this.allDetections.reduce((sum, d) => sum + d.confidence, 0);
-    this.stats.averageConfidence = totalConfidence / this.allDetections.length;
-    
-    // Update last detection time
-    this.stats.lastDetectionTime = Date.now();
-  }
-
-  /**
-   * Extracts current video frame as ImageData
-   */
-  getCurrentFrame(): ImageData | null {
-    if (!this.video || this.video.videoWidth === 0 || this.video.videoHeight === 0) {
-      return null;
-    }
-
-    this.updateCanvasSize();
-    this.drawCurrentFrame();
-    return this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+    // Tính trung bình bằng công thức toán học thay vì duyệt mảng
+    this.stats.averageConfidence = this.confidenceSum / this.totalCount;
   }
 
   private updateCanvasSize(): void {
-    if (!this.video) {
-      return;
-    }
-
+    if (!this.video) return;
     const targetWidth = this.rotateClockwise90 ? this.video.videoHeight : this.video.videoWidth;
     const targetHeight = this.rotateClockwise90 ? this.video.videoWidth : this.video.videoHeight;
 
@@ -172,24 +90,22 @@ export class VideoProcessor {
   }
 
   private drawCurrentFrame(): void {
-    if (!this.video) {
-      return;
-    }
+    if (!this.video) return;
 
     if (!this.rotateClockwise90) {
       this.ctx.drawImage(this.video, 0, 0, this.canvas.width, this.canvas.height);
-      return;
+    } else {
+      this.ctx.save();
+      this.ctx.translate(this.canvas.width, 0);
+      this.ctx.rotate(Math.PI / 2);
+      this.ctx.drawImage(this.video, 0, 0, this.video.videoWidth, this.video.videoHeight);
+      this.ctx.restore();
     }
-
-    this.ctx.save();
-    this.ctx.translate(this.canvas.width, 0);
-    this.ctx.rotate(Math.PI / 2);
-    this.ctx.drawImage(this.video, 0, 0, this.video.videoWidth, this.video.videoHeight);
-    this.ctx.restore();
   }
 
   reset(): void {
-    this.allDetections = [];
+    this.totalCount = 0;
+    this.confidenceSum = 0;
     this.stats = {
       totalDetections: 0,
       averageConfidence: 0,
@@ -197,13 +113,5 @@ export class VideoProcessor {
       classCounts: {}
     };
     this.statsCallback(this.stats);
-  }
-
-  exportDetections(): Detection[] {
-    return [...this.allDetections];
-  }
-
-  exportStats(): DetectionStats {
-    return { ...this.stats };
   }
 }
