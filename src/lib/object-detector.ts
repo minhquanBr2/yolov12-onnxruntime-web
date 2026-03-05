@@ -98,12 +98,32 @@ export class ObjectDetector {
   try {
     // --- BƯỚC 1: TIỀN XỬ LÝ ---
     sendLog('worker', 'Worker: Detector is detecting objects');
+
+    const sourcePixels = imageData.data;
+    const sourceSampleLength = Math.min(sourcePixels.length, 4000);
+    let sourceNonZero = 0;
+    let sourceSum = 0;
+    for (let i = 0; i < sourceSampleLength; i += 4) {
+      const r = sourcePixels[i];
+      const g = sourcePixels[i + 1];
+      const b = sourcePixels[i + 2];
+      sourceSum += r + g + b;
+      if (r !== 0 || g !== 0 || b !== 0) sourceNonZero++;
+    }
+    const sourcePixelCount = Math.max(1, Math.floor(sourceSampleLength / 4));
+    sendLog(
+      'worker',
+      `[Input] ${imageData.width}x${imageData.height}, nonZeroRatio=${(sourceNonZero / sourcePixelCount).toFixed(4)}, meanRgb=${(sourceSum / (sourcePixelCount * 3)).toFixed(2)}`
+    );
+
     inputTensor = this.preprocessImage(imageData);
     sendLog('worker', 'Preprocessing image...');
     
     // Log kiểm tra input: Lấy 5 giá trị đầu để xem có phải toàn 0 không
-    const inputSample = (inputTensor.data as Float32Array).slice(0, 5);
-    sendLog('worker', `[Step 1] Preprocess OK. Shape: ${inputTensor.dims.join('x')}. Sample: [${inputSample.join(', ')}]`);
+    const midIndex = Math.floor(inputTensor.data.length / 2);
+    const inputSample = (inputTensor.data as Float32Array).slice(midIndex, midIndex + 5);
+
+    sendLog('worker', `[Step 1] Sample at MID: [${inputSample.join(', ')}]`);
 
     // --- BƯỚC 2: CHẠY INFERENCE ---
     const inputName = this.session.inputNames[0];

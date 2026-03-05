@@ -8,7 +8,6 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
 import { VideoProcessor } from '@/lib/video-processor';
 import { Detection } from '@/lib/types';
-import { checkBrowserCompatibility } from '@/lib/browser-checks';
 import { Play, Square, Info, Camera, CameraOff } from 'lucide-react';
 import './globals.css';
 import { sendLog } from './lib/utils';
@@ -23,7 +22,7 @@ function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [detections, setDetections] = useState<Detection[]>([]);
   const [isCameraActive, setIsCameraActive] = useState(false);
-  const [isDeviceLandscape, setIsDeviceLandscape] = useState(window.matchMedia('(orientation: landscape)').matches);
+  const [isDeviceLandscape] = useState(window.matchMedia('(orientation: landscape)').matches);
   const [isCameraSourcePortrait, setIsCameraSourcePortrait] = useState(false);
   const [cameraSourceAspectRatio, setCameraSourceAspectRatio] = useState(16 / 9);
   const [isDetectorReady, setIsDetectorReady] = useState(false);
@@ -194,7 +193,17 @@ function App() {
         if (frame) {
           isDetectionInFlightRef.current = true;
           lastDetectionTimeRef.current = timestamp;
-          workerRef.current.postMessage({ type: 'detect', payload: { imageData: frame } }, [frame.data.buffer]);
+          workerRef.current.postMessage(
+            {
+              type: 'detect',
+              payload: {
+                width: frame.width,
+                height: frame.height,
+                data: frame.data
+              }
+            },
+            [frame.data.buffer]
+          );
         }
       }
       requestAnimationFrame(detectLoop);
@@ -215,7 +224,17 @@ function App() {
         const ctx = canvas.getContext('2d')!;
         ctx.drawImage(imageRef.current!, 0, 0);
         const imageData = ctx.getImageData(0, 0, naturalWidth, naturalHeight);
-        workerRef.current?.postMessage({ type: 'detect', payload: { imageData } }, [imageData.data.buffer]);
+        workerRef.current?.postMessage(
+          {
+            type: 'detect',
+            payload: {
+              width: imageData.width,
+              height: imageData.height,
+              data: imageData.data
+            }
+          },
+          [imageData.data.buffer]
+        );
       };
       return () => URL.revokeObjectURL(url);
     }
