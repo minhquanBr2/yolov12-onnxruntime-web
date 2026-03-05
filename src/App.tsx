@@ -22,7 +22,7 @@ function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [detections, setDetections] = useState<Detection[]>([]);
   const [isCameraActive, setIsCameraActive] = useState(false);
-  const [isDeviceLandscape] = useState(window.matchMedia('(orientation: landscape)').matches);
+  const [isDeviceLandscape, setIsDeviceLandscape] = useState(window.matchMedia('(orientation: landscape)').matches);
   const [isCameraSourcePortrait, setIsCameraSourcePortrait] = useState(false);
   const [cameraSourceAspectRatio, setCameraSourceAspectRatio] = useState(16 / 9);
   const [isDetectorReady, setIsDetectorReady] = useState(false);
@@ -65,6 +65,51 @@ function App() {
     }
     setVideoDimensions({ width: sourceWidth, height: sourceHeight });
   }, [isDeviceLandscape]);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(orientation: landscape)');
+
+    const handleOrientationChange = (event: MediaQueryListEvent) => {
+      setIsDeviceLandscape(event.matches);
+    };
+
+    setIsDeviceLandscape(mediaQuery.matches);
+
+    if (typeof mediaQuery.addEventListener === 'function') {
+      mediaQuery.addEventListener('change', handleOrientationChange);
+      return () => {
+        mediaQuery.removeEventListener('change', handleOrientationChange);
+      };
+    }
+
+    mediaQuery.addListener(handleOrientationChange);
+    return () => {
+      mediaQuery.removeListener(handleOrientationChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isCameraActive || !videoRef.current) {
+      return;
+    }
+
+    const { videoWidth, videoHeight } = videoRef.current;
+    if (!videoWidth || !videoHeight) {
+      return;
+    }
+
+    setIsCameraSourcePortrait(videoHeight > videoWidth);
+    setCameraSourceAspectRatio(videoHeight / videoWidth);
+    updateCameraDisplayDimensions(videoWidth, videoHeight);
+  }, [isCameraActive, isDeviceLandscape, updateCameraDisplayDimensions]);
+
+  useEffect(() => {
+    if (!isProcessingRef.current || !processorRef.current) {
+      return;
+    }
+
+    processorRef.current.setRotateClockwise90(shouldRotateCameraToLandscape);
+  }, [shouldRotateCameraToLandscape]);
 
   // --- 1. Khởi tạo Worker ---
   useEffect(() => {
@@ -126,6 +171,28 @@ function App() {
     setSelectedFile(null);
     setIsCameraActive(false);
   }, [stopProcessing]);
+
+  useEffect(() => {
+    if (!selectedFile || !videoRef.current || isCameraActive) {
+      return;
+    }
+
+    const videoElement = videoRef.current;
+    const objectUrl = URL.createObjectURL(selectedFile);
+
+    videoElement.pause();
+    videoElement.srcObject = null;
+    videoElement.src = objectUrl;
+    videoElement.load();
+
+    videoElement.play().catch(() => {
+      sendLog('info', 'Uploaded video is ready; waiting for user play interaction.');
+    });
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [selectedFile, isCameraActive]);
 
   // --- DỌN DẸP VIDEO ---
   const handleClearVideo = useCallback(() => {

@@ -18,8 +18,8 @@
     "right-headlight",
     "windshield"
   ],
-  "confidenceThreshold": 0.25,
-  "nmsThreshold": 0.4,
+  "confidenceThreshold": 0.1,
+  "nmsThreshold": 0.1,
   "modelName": "YOLOv8 Nano (Custom)",
   "version": "8.0.0",
   "description": "Custom YOLOv8 model optimized for mobile/edge devices.",
