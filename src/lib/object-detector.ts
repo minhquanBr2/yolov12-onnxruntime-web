@@ -50,6 +50,12 @@ export class ObjectDetector {
           sendLog('worker', `Trying execution provider: ${provider.name}`);
 
           // Thêm cấu hình giảm tải bộ nhớ trong InferenceSession.create
+          // this.session = await ort.InferenceSession.create(`${basePath}models/yolov12n.onnx`, {
+          //   executionProviders: [provider.name],
+          //   graphOptimizationLevel: 'all',
+          //   enableCpuMemArena: false, // Tắt arena để tiết kiệm RAM trên mobile
+          //   enableMemPattern: false    // Tắt memory pattern nếu vẫn còn crash
+          // });
           this.session = await ort.InferenceSession.create(`${basePath}models/yolo_vehicle_detection_model.onnx`, {
             executionProviders: [provider.name],
             graphOptimizationLevel: 'all',
@@ -97,7 +103,6 @@ export class ObjectDetector {
 
   try {
     // --- BƯỚC 1: TIỀN XỬ LÝ ---
-    sendLog('worker', 'Worker: Detector is detecting objects');
 
     const sourcePixels = imageData.data;
     const sourceSampleLength = Math.min(sourcePixels.length, 4000);
@@ -113,23 +118,17 @@ export class ObjectDetector {
     const sourcePixelCount = Math.max(1, Math.floor(sourceSampleLength / 4));
     sendLog(
       'worker',
-      `[Input] ${imageData.width}x${imageData.height}, nonZeroRatio=${(sourceNonZero / sourcePixelCount).toFixed(4)}, meanRgb=${(sourceSum / (sourcePixelCount * 3)).toFixed(2)}`
+      `[Input] Width: ${imageData.width}, height: ${imageData.height}, nonZeroRatio=${(sourceNonZero / sourcePixelCount).toFixed(4)}, meanRgb=${(sourceSum / (sourcePixelCount * 3)).toFixed(2)}`
     );
 
     inputTensor = this.preprocessImage(imageData);
-    sendLog('worker', 'Preprocessing image...');
-    
-    // Log kiểm tra input: Lấy 5 giá trị đầu để xem có phải toàn 0 không
-    const midIndex = Math.floor(inputTensor.data.length / 2);
-    const inputSample = (inputTensor.data as Float32Array).slice(midIndex, midIndex + 5);
-
-    sendLog('worker', `[Step 1] Sample at MID: [${inputSample.join(', ')}]`);
 
     // --- BƯỚC 2: CHẠY INFERENCE ---
     const inputName = this.session.inputNames[0];
     const startTime = performance.now();
     results = await this.session.run({ [inputName]: inputTensor });
     const endTime = performance.now();
+    sendLog('worker', `[Step 2] Inference Time: ${(endTime - startTime).toFixed(2)}ms`);
 
     // --- BƯỚC 3: KIỂM TRA OUTPUT TENSOR ---
     const outputName = this.session.outputNames[0];
@@ -144,13 +143,44 @@ export class ObjectDetector {
         sum += rawData[i];
     }
 
-    sendLog('worker', `[Step 2] Inference Time: ${(endTime - startTime).toFixed(2)}ms`);
-    sendLog('worker', `[Step 3] Output Dims: ${outputTensor.dims.join('x')}. Data Stats (first 1000): min=${min.toFixed(4)}, max=${max.toFixed(4)}, avg=${(sum/1000).toFixed(4)}`);
+    // --- ĐOẠN CODE KIỂM TRA MAX CONFIDENCE MỖI CLASS ---
+    const numChannels = 17; // Số hàng
+    const numAnchors = 8400; // Số cột (anchors)
+    const numClasses = numChannels - 4; // Giả sử 4 hàng đầu là x, y, w, h
+
+    for (let c = 0; c < numClasses; c++) {
+        let maxScore = -Infinity;
+        let bestAnchorIdx = -1;
+        
+        // Hàng chứa score của class này bắt đầu từ index 4
+        const classRowStart = (4 + c) * numAnchors; 
+
+        for (let a = 0; a < numAnchors; a++) {
+            const score = rawData[classRowStart + a];
+            if (score > maxScore) {
+                maxScore = score;
+                bestAnchorIdx = a;
+            }
+        }
+
+        if (maxScore > 0.01) { // Chỉ log những class có xác suất đáng kể
+            // Lấy tọa độ tương ứng của anchor tốt nhất này (4 hàng đầu tiên)
+            const x = rawData[0 * numAnchors + bestAnchorIdx];
+            const y = rawData[1 * numAnchors + bestAnchorIdx];
+            const w = rawData[2 * numAnchors + bestAnchorIdx];
+            const h = rawData[3 * numAnchors + bestAnchorIdx];
+
+            sendLog('worker', 
+                `Class ${c}: MaxScore=${maxScore.toFixed(4)} | Anchor=${bestAnchorIdx} | Rect=[x:${x.toFixed(1)}, y:${y.toFixed(1)}, w:${w.toFixed(1)}, h:${h.toFixed(1)}]`
+            );
+        }
+    }
+    // ------------------------------------------------
 
     // --- BƯỚC 4: HẬU XỬ LÝ ---
     // Nếu max score quá thấp (ví dụ < 0.1), chắc chắn là model ko nhận diện được gì
     if (max < (this.metadata?.confidenceThreshold || 0.3)) {
-        sendLog('warn', `[Step 4] Warning: Max raw score (${max.toFixed(4)}) is below threshold. Probably no objects found.`);
+        // sendLog('warn', `[Step 4] Warning: Max raw score (${max.toFixed(4)}) is below threshold. Probably no objects found.`);
     }
 
     const detections = this.postprocessResults(outputTensor, imageData.width, imageData.height);
@@ -193,6 +223,7 @@ export class ObjectDetector {
     ctx.fillRect(0, 0, inputWidth, inputHeight);
     
     // Calculate scaling and positioning to maintain aspect ratio
+    sendLog('info', `[Preprocess] Image aspect ratio: ${imageData.width}/${imageData.height} = ${imageData.width / imageData.height}`);
     const aspectRatio = imageData.width / imageData.height;
     const targetAspectRatio = inputWidth / inputHeight;
     

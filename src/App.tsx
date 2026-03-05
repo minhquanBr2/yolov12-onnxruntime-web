@@ -12,7 +12,7 @@ import { Play, Square, Info, Camera, CameraOff } from 'lucide-react';
 import './globals.css';
 import { sendLog } from './lib/utils';
 
-const DETECTION_FPS = 5;
+const DETECTION_FPS = 1;
 const DETECTION_INTERVAL_MS = 1000 / DETECTION_FPS;
 
 function App() {
