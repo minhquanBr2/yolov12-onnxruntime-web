@@ -1,6 +1,6 @@
 import * as ort from 'onnxruntime-web/webgpu';
 import { Detection, ModelMetadata } from './types';
-
+import { sendLog } from './utils';
 /**
  * Object detection using YOLOv8 - vehicle detection ONNX model via ONNX Runtime Web
  */
@@ -30,6 +30,7 @@ export class ObjectDetector {
       
       // Load model metadata
       const metadataResponse = await fetch(`${basePath}models/model-metadata-vehicle-detection.json`);
+      // const metadataResponse = await fetch(`${basePath}models/model-metadata.json`);
       this.metadata = await metadataResponse.json();
       
       // Try different execution providers in order of preference.
@@ -46,7 +47,7 @@ export class ObjectDetector {
       for (const provider of executionProviders) {
         try {
           // 1. Log chính xác tên provider đang thử (ví dụ: 'webgpu')
-          console.log(`Trying execution provider: ${provider.name}`);
+          sendLog('worker', `Trying execution provider: ${provider.name}`);
 
           // Thêm cấu hình giảm tải bộ nhớ trong InferenceSession.create
           this.session = await ort.InferenceSession.create(`${basePath}models/yolo_vehicle_detection_model.onnx`, {
@@ -56,14 +57,14 @@ export class ObjectDetector {
             enableMemPattern: false    // Tắt memory pattern nếu vẫn còn crash
           });
 
-          console.log('Model input names:', this.session.inputNames);
-          console.log('Model output names:', this.session.outputNames);
-          console.log('Model input metadata:', this.session.inputMetadata);
-          console.log('Model output metadata:', this.session.outputMetadata);
+          sendLog('worker', `Model input names: ${this.session.inputNames.join(', ')}`);
+          sendLog('worker', `Model output names: ${this.session.outputNames.join(', ')}`);
+          sendLog('worker', `Model input metadata: ${JSON.stringify(this.session.inputMetadata)}`);
+          sendLog('worker', `Model output metadata: ${JSON.stringify(this.session.outputMetadata)}`);
 
           // 2. Nếu thành công
           this.isInitialized = true;
-          console.log(`Object detector initialized successfully with provider: ${provider.name}`);
+          sendLog('worker', `Object detector initialized successfully with provider: ${provider.name}`);
           return; // Thoát hàm initialize
 
         } catch (error) {
@@ -111,13 +112,13 @@ export class ObjectDetector {
       const outputTensor = results[outputName];
 
       // 4. Hậu xử lý (NMS, Scaling...)
-      console.log('Output tensor shape:', outputTensor.dims);
-      console.log('Output tensor', outputTensor);
+      sendLog('worker', `Output tensor shape: ${outputTensor.dims.join('x')}`);
+      sendLog('worker', `Output tensor: ${JSON.stringify(outputTensor)}`);
 
       const detections = this.postprocessResults(outputTensor, imageData.width, imageData.height);
-      console.log('Detected objects:', detections);
-      console.log(
-        `[Frame] Final detections (${detections.length}):`,
+      sendLog('worker', `Detected objects: ${JSON.stringify(detections)}`);
+      sendLog('worker',
+        `[Frame] Final detections (${detections.length}): ` + 
         detections.map((detection, index) => ({
           index,
           class: detection.class,
@@ -300,7 +301,7 @@ export class ObjectDetector {
         const cy = getValue(1, i);
         const w = getValue(2, i);
         const h = getValue(3, i);
-        console.log(`Anchor ${i}: cx=${cx}, cy=${cy}, w=${w}, h=${h}`);
+        sendLog('worker', `Anchor ${i}: cx=${cx}, cy=${cy}, w=${w}, h=${h}`);
 
         // Chuyển từ Center (cx, cy) sang Top-Left (x1, y1)
         const x1 = cx - w / 2;

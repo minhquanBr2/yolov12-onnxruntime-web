@@ -7,6 +7,7 @@ export class VideoProcessor {
   private video: HTMLVideoElement | null = null;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  private rotateClockwise90 = false;
   private isProcessing = false;
   private frameRate = 10; // Process 10 frames per second
   private lastFrameTime = 0;
@@ -37,8 +38,12 @@ export class VideoProcessor {
    */
   setVideo(video: HTMLVideoElement): void {
     this.video = video;
-    this.canvas.width = video.videoWidth;
-    this.canvas.height = video.videoHeight;
+    this.updateCanvasSize();
+  }
+
+  setRotateClockwise90(rotate: boolean): void {
+    this.rotateClockwise90 = rotate;
+    this.updateCanvasSize();
   }
 
   setFrameRate(fps: number): void {
@@ -85,14 +90,8 @@ export class VideoProcessor {
       return;
     }
 
-    // Update canvas size if video size changed
-    if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
-      this.canvas.width = this.video.videoWidth;
-      this.canvas.height = this.video.videoHeight;
-    }
-
-    // Draw current video frame to canvas
-    this.ctx.drawImage(this.video, 0, 0, this.canvas.width, this.canvas.height);
+    this.updateCanvasSize();
+    this.drawCurrentFrame();
     
     // Get image data for processing
     const imageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
@@ -153,8 +152,40 @@ export class VideoProcessor {
       return null;
     }
 
-    this.ctx.drawImage(this.video, 0, 0, this.canvas.width, this.canvas.height);
+    this.updateCanvasSize();
+    this.drawCurrentFrame();
     return this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+  }
+
+  private updateCanvasSize(): void {
+    if (!this.video) {
+      return;
+    }
+
+    const targetWidth = this.rotateClockwise90 ? this.video.videoHeight : this.video.videoWidth;
+    const targetHeight = this.rotateClockwise90 ? this.video.videoWidth : this.video.videoHeight;
+
+    if (this.canvas.width !== targetWidth || this.canvas.height !== targetHeight) {
+      this.canvas.width = targetWidth;
+      this.canvas.height = targetHeight;
+    }
+  }
+
+  private drawCurrentFrame(): void {
+    if (!this.video) {
+      return;
+    }
+
+    if (!this.rotateClockwise90) {
+      this.ctx.drawImage(this.video, 0, 0, this.canvas.width, this.canvas.height);
+      return;
+    }
+
+    this.ctx.save();
+    this.ctx.translate(this.canvas.width, 0);
+    this.ctx.rotate(Math.PI / 2);
+    this.ctx.drawImage(this.video, 0, 0, this.video.videoWidth, this.video.videoHeight);
+    this.ctx.restore();
   }
 
   reset(): void {

@@ -6,12 +6,12 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
-import { ObjectDetector } from '@/lib/object-detector';
 import { VideoProcessor } from '@/lib/video-processor';
 import { Detection } from '@/lib/types';
 import { checkBrowserCompatibility } from '@/lib/browser-checks';
 import { Play, Square, Info, Camera, CameraOff } from 'lucide-react';
 import './globals.css';
+import { sendLog } from './lib/utils'
 
 const DETECTION_FPS = 5;
 const DETECTION_INTERVAL_MS = 1000 / DETECTION_FPS;
@@ -23,6 +23,10 @@ function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [detections, setDetections] = useState<Detection[]>([]);
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [isDeviceLandscape, setIsDeviceLandscape] = useState(window.matchMedia('(orientation: landscape)').matches);
+  const [isCameraSourcePortrait, setIsCameraSourcePortrait] = useState(false);
+  const [cameraSourceAspectRatio, setCameraSourceAspectRatio] = useState(16 / 9);
+  const [isDetectorReady, setIsDetectorReady] = useState(false);
   const [videoDimensions, setVideoDimensions] = useState({ width: 640, height: 480 });
   const [imageDimensions, setImageDimensions] = useState({ width: 640, height: 480 });
   const [isInfoDialogOpen, setIsInfoDialogOpen] = useState(false);
@@ -31,9 +35,24 @@ function App() {
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
-  const detectorRef = useRef<ObjectDetector | null>(null);
   const processorRef = useRef<VideoProcessor | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const shouldRotateCameraToLandscape = isCameraActive && isDeviceLandscape && isCameraSourcePortrait;
+  const cameraPreviewTransform = shouldRotateCameraToLandscape
+    ? `rotate(90deg) scale(${cameraSourceAspectRatio})`
+    : 'none';
+
+  const updateCameraDisplayDimensions = useCallback((sourceWidth: number, sourceHeight: number) => {
+    const shouldRotate = isDeviceLandscape && sourceHeight > sourceWidth;
+
+    if (shouldRotate) {
+      setVideoDimensions({ width: sourceHeight, height: sourceWidth });
+      return;
+    }
+
+    setVideoDimensions({ width: sourceWidth, height: sourceHeight });
+  }, [isDeviceLandscape]);
 
   // Check browser compatibility on mount
   useEffect(() => {
@@ -42,6 +61,41 @@ function App() {
       console.error('Browser compatibility issues:', compatibility.errors.join(' '));
     }
   }, []);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(orientation: landscape)');
+
+    const handleOrientationChange = (event: MediaQueryListEvent) => {
+      setIsDeviceLandscape(event.matches);
+    };
+
+    setIsDeviceLandscape(mediaQuery.matches);
+
+    if (typeof mediaQuery.addEventListener === 'function') {
+      mediaQuery.addEventListener('change', handleOrientationChange);
+      return () => {
+        mediaQuery.removeEventListener('change', handleOrientationChange);
+      };
+    }
+
+    mediaQuery.addListener(handleOrientationChange);
+    return () => {
+      mediaQuery.removeListener(handleOrientationChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isCameraActive || !videoRef.current) {
+      return;
+    }
+
+    const { videoWidth, videoHeight } = videoRef.current;
+    if (!videoWidth || !videoHeight) {
+      return;
+    }
+
+    updateCameraDisplayDimensions(videoWidth, videoHeight);
+  }, [isCameraActive, isDeviceLandscape, updateCameraDisplayDimensions]);
 
   // Clear detections and file selections when changing tabs
   useEffect(() => {
@@ -86,34 +140,46 @@ function App() {
 
   // Initialize detector
   useEffect(() => {
-    const initDetector = async () => {
-      try {
-        console.log('Initializing AI detector...');
-        const detector = new ObjectDetector();
-        await detector.initialize();
-        detectorRef.current = detector;
-        console.log('AI detector initialized successfully');
-      } catch (err) {
-        console.error('Failed to initialize AI detector. Please check that the model file is available:', err);
+    sendLog('info', 'Spawning AI Worker...');
+    // Khởi tạo worker
+    const worker = new Worker(new URL('./lib/detector.worker.ts', import.meta.url), {
+      type: 'module'
+    });
+
+    worker.onmessage = (e) => {
+      const { type, detections, error } = e.data;
+      if (type === 'ready') {
+        setIsDetectorReady(true);
+        sendLog('info', 'Worker is ready');
+      }
+      if (type === 'results') {        
+        setDetections(detections);      // Cập nhật detections lên UI
+        setIsProcessing(false);         // Tắt loading khi có kết quả
+        if (processorRef.current) {
+          processorRef.current.updateDetections(detections);
+        }
+      }
+      if (type === 'error') {
+        sendLog('info', `Worker error: ${error}`);
+        setIsProcessing(false);
       }
     };
 
-    initDetector();
+    worker.postMessage({ type: 'init' });
+    workerRef.current = worker;
 
     return () => {
-      if (detectorRef.current) {
-        detectorRef.current.dispose();
-      }
+      worker.terminate();
     };
   }, []);
 
   // Handle video element becoming available when camera is active
   useEffect(() => {
     if (isCameraActive && streamRef.current && videoRef.current) {
-      console.log('Video element became available, setting stream');
+      sendLog('info', 'Video element became available, setting stream');
       videoRef.current.srcObject = streamRef.current;
       videoRef.current.play().catch((err) => {
-        console.error('Failed to start camera preview:', err);
+        sendLog('error', `Failed to start camera preview: ${err.message}`);
       });
     }
   }, [isCameraActive]);
@@ -147,7 +213,13 @@ function App() {
       
       // Set dimensions when image loads and automatically trigger detection
       const handleImageLoad = async () => {
-        if (imageRef.current && detectorRef.current) {
+        if (imageRef.current) {
+          if (!workerRef.current || !isDetectorReady) {
+            sendLog('warn', 'Detector worker is not ready for image detection');
+            setIsProcessing(false);
+            return;
+          }
+
           const { naturalWidth, naturalHeight } = imageRef.current;
           setImageDimensions({ width: naturalWidth, height: naturalHeight });
           
@@ -168,11 +240,14 @@ function App() {
             ctx.drawImage(imageRef.current, 0, 0);
 
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const newDetections = await detectorRef.current.detectObjects(imageData);
-            setDetections(newDetections);
+
+            // SỬA TẠI ĐÂY: Dùng optional chaining hoặc kiểm tra null
+            workerRef.current?.postMessage(
+              { type: 'detect', payload: { imageData } },
+              [imageData.data.buffer] 
+            );
           } catch (err) {
-            console.error('Failed to detect objects in image:', err);
-          } finally {
+            sendLog('error', `Failed to detect objects in image: ${err instanceof Error ? err.message : String(err)}`);
             setIsProcessing(false);
           }
         }
@@ -234,14 +309,14 @@ function App() {
 
   // Handle camera stream
   const handleCameraStart = useCallback((stream: MediaStream) => {
-    console.log('handleCameraStart called with stream:', stream);
+    sendLog('info', `handleCameraStart called with stream: ${stream}`);
     streamRef.current = stream;
     setIsCameraActive(true);
     
     // Wait for the video element to be rendered after isCameraActive becomes true
     const setStreamToVideo = () => {
       if (videoRef.current) {
-        console.log('Setting stream to video element');
+        sendLog('info', 'Setting stream to video element');
         
         // Clear any existing source first
         videoRef.current.srcObject = null;
@@ -252,14 +327,15 @@ function App() {
         // Wait a bit for the stream to be ready, then play
         setTimeout(() => {
           if (videoRef.current && videoRef.current.srcObject) {
-            console.log('Attempting to play video');
+            sendLog('info', 'Attempting to play video');
             videoRef.current.play().catch((err) => {
               console.error('Failed to start camera preview:', err);
+              sendLog('error', 'Failed to start camera preview');
             });
           }
         }, 100);
       } else {
-        console.log('Video element not ready yet, retrying...');
+        sendLog('info', 'Video element not ready yet, retrying...');
         setTimeout(setStreamToVideo, 50);
       }
     };
@@ -283,6 +359,8 @@ function App() {
     }
     
     setIsCameraActive(false);
+    setIsCameraSourcePortrait(false);
+    setCameraSourceAspectRatio(16 / 9);
     
     if (videoRef.current) {
       videoRef.current.srcObject = null;
@@ -293,7 +371,19 @@ function App() {
 
   // Start/stop processing
   const startProcessing = useCallback(async () => {
-    if (!detectorRef.current || !videoRef.current) return;
+    if (videoRef.current) {
+      sendLog('info', 'Video element is available');
+    } else {
+      sendLog('warn', 'Video element is not available');
+    }
+
+    if (!workerRef.current || !isDetectorReady) {
+      sendLog('warn', 'Detector worker is not ready');
+      return;
+    }
+
+    if (!videoRef.current) return;
+    sendLog('info', `Starting processing`);
 
     try {
       setIsProcessing(true);
@@ -301,13 +391,14 @@ function App() {
 
       const processor = new VideoProcessor(
         (newDetections) => {
-          console.log(`Displaying ${newDetections.length} detections for current frame`);
+          sendLog('info', `Displaying ${newDetections.length} detections for current frame`);
           setDetections(newDetections);
         },
         () => {} // Stats callback not needed anymore
       );
 
       processor.setVideo(videoRef.current);
+      processor.setRotateClockwise90(shouldRotateCameraToLandscape);
       processor.setFrameRate(DETECTION_FPS);
       processor.startProcessing();
       processorRef.current = processor;
@@ -317,32 +408,27 @@ function App() {
 
       // Start detection loop
       const detectLoop = (timestamp: number) => {
-        if (!detectorRef.current || !processorRef.current) return;
+        if (!workerRef.current || !processorRef.current || !isDetectorReady) return;
 
         if (!isDetectionInFlight && timestamp - lastDetectionTime >= DETECTION_INTERVAL_MS) {
           const frame = processorRef.current.getCurrentFrame();
           if (frame) {
-            isDetectionInFlight = true;
+            isDetectionInFlight = true; // Flag này vẫn dùng để tránh spam worker
             lastDetectionTime = timestamp;
 
-            detectorRef.current.detectObjects(frame)
-              .then((newDetections) => {
-                if (processorRef.current) {
-                  processorRef.current.updateDetections(newDetections);
-                }
-              })
-              .catch((err) => {
-                console.error('Detection error:', err);
-              })
-              .finally(() => {
-                isDetectionInFlight = false;
-              });
-          } else {
-            setDetections([]);
+            // Gửi frame sang worker. 
+            // Dùng Transferable Objects để ko copy dữ liệu (giảm RAM)
+            workerRef.current?.postMessage(
+              { type: 'detect', payload: { imageData: frame } },
+              [frame.data.buffer]
+            );
+
+            // Reset flag sau một khoảng thời gian hoặc dựa trên message 'results'
+            // Để đơn giản, ta reset sau khi worker gửi kết quả về (đã sửa ở useEffect trên)
+            isDetectionInFlight = false; 
           }
         }
 
-        // Continue loop if processing and not paused
         if (processorRef.current && !processorRef.current.isProcessingStopped()) {
           requestAnimationFrame(detectLoop);
         }
@@ -353,7 +439,7 @@ function App() {
       console.error('Failed to start processing:', err);
       setIsProcessing(false);
     }
-  }, []);
+  }, [shouldRotateCameraToLandscape]);
 
   const stopProcessing = useCallback(() => {
     setIsProcessing(false);
@@ -364,6 +450,14 @@ function App() {
 
     setDetections([]);
   }, []);
+
+  useEffect(() => {
+    if (!isProcessing || !processorRef.current) {
+      return;
+    }
+
+    processorRef.current.setRotateClockwise90(shouldRotateCameraToLandscape);
+  }, [isProcessing, shouldRotateCameraToLandscape]);
 
 
   return (
@@ -517,26 +611,38 @@ function App() {
                       </div>
                     ) : (
                       <>
-                        <video
-                          ref={videoRef}
-                          className="w-full h-auto max-h-[600px] object-contain"
-                          muted
-                          playsInline
-                          autoPlay
-                          preload="none"
-                          onLoadedMetadata={() => {
-                            if (videoRef.current) {
-                              const { videoWidth, videoHeight } = videoRef.current;
-                              setVideoDimensions({ width: videoWidth, height: videoHeight });
-                            }
-                          }}
-                        />
-                        <DetectionOverlay
-                          detections={detections}
-                          videoWidth={videoDimensions.width}
-                          videoHeight={videoDimensions.height}
-                          className="absolute inset-0"
-                        />
+                        <div className="relative w-full h-[60vh] min-h-[400px] max-h-[600px] overflow-hidden">
+                          <div
+                            className="absolute inset-0"
+                            style={{
+                              transform: cameraPreviewTransform,
+                              transformOrigin: 'center center'
+                            }}
+                          >
+                            <video
+                              ref={videoRef}
+                              className="w-full h-full object-contain"
+                              muted
+                              playsInline
+                              autoPlay
+                              preload="none"
+                              onLoadedMetadata={() => {
+                                if (videoRef.current) {
+                                  const { videoWidth, videoHeight } = videoRef.current;
+                                  setIsCameraSourcePortrait(videoHeight > videoWidth);
+                                  setCameraSourceAspectRatio(videoHeight / videoWidth);
+                                  updateCameraDisplayDimensions(videoWidth, videoHeight);
+                                }
+                              }}
+                            />
+                            <DetectionOverlay
+                              detections={detections}
+                              videoWidth={videoDimensions.width}
+                              videoHeight={videoDimensions.height}
+                              className="absolute inset-0"
+                            />
+                          </div>
+                        </div>
                       </>
                     )}
                   </div>
@@ -559,6 +665,7 @@ function App() {
                                 video: {
                                   width: { ideal: 1280 },
                                   height: { ideal: 720 },
+                                  aspectRatio: { ideal: 16 / 9 },
                                   frameRate: { ideal: 30 },
                                   facingMode: { ideal: 'environment' }
                                 },
@@ -634,30 +741,30 @@ function App() {
                         onLoadedMetadata={() => {
                           if (videoRef.current) {
                             const { videoWidth, videoHeight } = videoRef.current;
-                            console.log(`Video dimensions: ${videoWidth}x${videoHeight}`);
+                            sendLog('info', `Video dimensions: ${videoWidth}x${videoHeight}`);
                             setVideoDimensions({ width: videoWidth, height: videoHeight });
                           }
                         }}
                         onCanPlay={() => {
-                          console.log('Video can play');
+                          sendLog('info', 'Video can play');
                         }}
                         onPlaying={() => {
-                          console.log('Video is playing');
+                          sendLog('info', 'Video is playing');
                         }}
-                        onError={(e) => {
-                          console.error('Video error:', e);
+                        onError={() => {
+                          sendLog('error', 'Video error:');
                           const error = videoRef.current?.error;
                           if (error) {
-                            console.error('Video error details:', {
+                            sendLog('error', 'Video error details: ' + JSON.stringify({
                               code: error.code,
                               message: error.message
-                            });
+                            }));
                           }
                         }}
                         onEnded={() => {
                           // Stop detection when uploaded video ends (not for camera streams)
                           if (!isCameraActive && selectedFile && isProcessing) {
-                            console.log('Video ended, stopping detection');
+                            sendLog('info', 'Video ended, stopping detection');
                             stopProcessing();
                           }
                         }}
